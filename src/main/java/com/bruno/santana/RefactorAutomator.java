@@ -2,6 +2,7 @@ package com.bruno.santana;
 
 import org.apache.maven.shared.invoker.DefaultInvoker;
 import org.apache.maven.shared.invoker.DefaultInvocationRequest;
+import org.apache.maven.shared.invoker.InvocationRequest;
 import org.apache.maven.shared.invoker.InvocationResult;
 import org.apache.maven.shared.invoker.Invoker;
 import org.eclipse.jgit.api.Git;
@@ -16,11 +17,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 public class RefactorAutomator {
@@ -32,6 +33,7 @@ public class RefactorAutomator {
     private final String oldArtifactId;
     private final String newVersion;
     private final String githubToken;
+    private final String customRecipeName = "com.bruno.santana.UpgradeDependencyVersionExample";
 
     public RefactorAutomator(String githubToken,
                              String oldGroupId, String oldArtifactId,
@@ -158,75 +160,82 @@ public class RefactorAutomator {
     }
 
     private void applyOpenRewriteRecipe(Path repoPath) throws Exception {
-        //Better check this doc and try to fix this code: https://docs.openrewrite.org/recipes/maven/upgradedependencyversion
+        logger.info("Applying OpenRewrite recipe to update {} using maven-invoker", oldArtifactId);
 
-        logger.info("Applying OpenRewrite recipe to update {}", oldArtifactId);
+        // 1. Create the rewrite.yml file
+        writeRewriteYml(repoPath);
 
-        try {
-            // 1. Get the full path to the Maven executable
-            String mavenHome = System.getenv("MAVEN_HOME");
-            if (mavenHome == null) {
-                mavenHome = System.getenv("M2_HOME");
-            }
+        // 2. Prepare the Maven Invoker Request
+        InvocationRequest request = new DefaultInvocationRequest();
 
-            String mavenExecutable;
-            if (mavenHome != null && !mavenHome.isEmpty()) {
-                mavenExecutable = Paths.get(mavenHome, "bin", "mvn").toString();
-                logger.info("Using Maven executable: {}", mavenExecutable);
-            } else {
-                logger.warn("MAVEN_HOME or M2_HOME not set. Falling back to 'mvn'.");
-                mavenExecutable = "mvn";
-            }
+        // Set the base directory for the Maven execution (the cloned repo)
+        request.setBaseDirectory(repoPath.toFile());
 
-            String rewriteVersion = "5.41.0";
-            String rewriteGoal = String.format(
-                    "org.openrewrite.maven:rewrite-maven-plugin:%s:run",
-                    rewriteVersion
-            );
+        // This requires the rewrite plugin to be configured in the target repo's POM
+        String rewriteGoal = "rewrite:run";
+        request.setGoals(Collections.singletonList(rewriteGoal));
 
-            // === THIS IS THE FIX ===
-            // 2. Build the ENTIRE command as a single string,
-            //    but wrap each -D property in quotes for the shell.
-            String commandString = String.format(
-                    "%s %s \"-Drewrite.activeRecipes=org.openrewrite.maven.UpgradeDependencyVersion\" \"-DgroupId=%s\" \"-DartifactId=%s\" \"-DnewVersion=%s\"",
-                    mavenExecutable,
-                    rewriteGoal,
-                    oldGroupId,
-                    oldArtifactId,
-                    newVersion
-            );
-            // === END FIX ===
+        // Set the properties (active recipe and where to find the recipe file)
+        request.setProperties(new java.util.Properties() {{
+            // Tell OpenRewrite to look for recipes in the current directory's rewrite.yml
+            setProperty("rewrite.configLocation", repoPath.resolve("rewrite.yml").toString());
 
-            logger.info("Running command via shell: {}", commandString);
-            logger.info("  groupId: {}", oldGroupId);
-            logger.info("  artifactId: {}", oldArtifactId);
-            logger.info("  newVersion: {}", newVersion);
+            // Tell OpenRewrite which recipe to run (our custom wrapper)
+            setProperty("rewrite.activeRecipes", customRecipeName);
+        }});
 
-            // 3. Execute the command string using the system shell
-            ProcessBuilder pb = new ProcessBuilder(
-                    "/bin/sh",  // The shell
-                    "-c",       // Argument to pass a command string
-                    commandString // The command
-            );
+        // 3. Execute the Invoker
+        Invoker invoker = new DefaultInvoker();
 
-            pb.directory(repoPath.toFile()); // Run it in the cloned repo's directory
-            pb.inheritIO(); // Show the output in our logs
-
-            Process process = pb.start();
-            int exitCode = process.waitFor(); // Wait for it to finish
-
-            if (exitCode != 0) {
-                logger.warn("OpenRewrite exited with code: {}", exitCode);
-            } else {
-                logger.info("OpenRewrite completed successfully");
-            }
-
-            logger.info("OpenRewrite recipe applied");
-
-        } catch (Exception e) {
-            logger.error("Error applying OpenRewrite recipe: {}", e.getMessage(), e);
-            throw e;
+        String mavenHome = System.getenv("MAVEN_HOME");
+        if (mavenHome == null) {
+            mavenHome = System.getenv("M2_HOME");
         }
+        if (mavenHome != null && !mavenHome.isEmpty()) {
+            invoker.setMavenHome(new File(mavenHome));
+            logger.info("Using Maven Home: {}", mavenHome);
+        } else {
+            // If Maven home isn't set, invoker relies on 'mvn' being in the PATH
+            logger.warn("MAVEN_HOME/M2_HOME not set. Invoker relies on 'mvn' being in PATH.");
+        }
+
+        InvocationResult result = invoker.execute(request);
+
+        // 4. Check the result
+        if (result.getExitCode() != 0) {
+            // Log the error and throw an exception to stop processing this repo
+            logger.error("OpenRewrite execution failed. Exit code: {}", result.getExitCode());
+            if (result.getExecutionException() != null) {
+                throw new Exception("Maven execution failed", result.getExecutionException());
+            } else {
+                throw new Exception("OpenRewrite exited with code " + result.getExitCode());
+            }
+        } else {
+            logger.info("OpenRewrite completed successfully");
+        }
+    }
+
+    private void writeRewriteYml(Path repoPath) throws IOException {
+        Path rewriteYmlPath = repoPath.resolve("rewrite.yml");
+        logger.info("Creating custom recipe file: {}", rewriteYmlPath);
+
+        String yamlContent = String.format(
+                "---%n" +
+                        "type: specs.openrewrite.org/v1beta/recipe%n" +
+                        "name: %s%n" +
+                        "displayName: Upgrade Maven dependency version example%n" +
+                        "recipeList:%n" +
+                        "  - org.openrewrite.maven.UpgradeDependencyVersion:%n" +
+                        "      groupId: %s%n" +
+                        "      artifactId: %s%n" +
+                        "      newVersion: %s%n",
+                customRecipeName,
+                oldGroupId,
+                oldArtifactId,
+                newVersion
+        );
+
+        Files.write(rewriteYmlPath, yamlContent.getBytes(StandardCharsets.UTF_8));
     }
 
     private boolean hasChanges(Path repoPath) throws IOException, GitAPIException {
@@ -254,25 +263,41 @@ public class RefactorAutomator {
 
         Git git = new Git(repository);
 
-        // Stage all changes
+        // 1. Stage files
+        logger.info("Staging files");
         git.add().addFilepattern(".").call();
 
-        // Commit
-        String commitMessage = String.format("chore: upgrade %s to %s", artifactId, version);
-        git.commit()
-                .setMessage(commitMessage)
-                .setAuthor("OpenRewrite Bot", "bot@example.com")
-                .call();
+        // 2. Unstage the temporary rewrite.yml file (defensive cleanup)
+        // If the file exists, this ensures it's not part of the commit.
+        try {
+            git.reset().addPath("rewrite.yml").call();
+        } catch (Exception e) {
+            // Ignore error if rewrite.yml doesn't exist or isn't staged
+        }
+
+        // 3. Check if there are any staged changes remaining to be committed
+        org.eclipse.jgit.api.Status status = git.status().call();
+
+        // Check if the index (staging area) contains any changes (added, changed)
+        boolean hasStagedChanges = !status.getAdded().isEmpty() || !status.getChanged().isEmpty();
+
+        if (hasStagedChanges) {
+            // Commit
+            String commitMessage = String.format("chore: upgrade %s to %s", artifactId, version);
+            git.commit()
+                    .setMessage(commitMessage)
+                    .setAuthor("OpenRewrite Bot", "bot@example.com")
+                    .call();
+            logger.info("Changes committed with message: {}", commitMessage);
+        } else {
+            logger.warn("No pom.xml changes were staged for commit, skipping commit.");
+        }
 
         git.close();
         repository.close();
-
-        logger.info("Changes committed with message: {}", commitMessage);
     }
 
     private void pushBranch(Path repoPath, String branchName) throws IOException, GitAPIException {
-        logger.info("Pushing branch: {}", branchName);
-
         Repository repository = new FileRepositoryBuilder()
                 .setGitDir(repoPath.resolve(".git").toFile())
                 .build();
